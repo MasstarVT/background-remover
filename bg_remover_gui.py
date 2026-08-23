@@ -77,10 +77,10 @@ DEFAULT_BRUSH = 40
 # composition ambiguity no model here fully resolves - all four were tested
 # against exactly that case. That's what the touch-up brush is for.
 MODELS = [
+    ("High Quality (birefnet, slower)", "birefnet-general"),
     ("General (u2net)", "u2net"),
     ("General v2 (isnet-general-use)", "isnet-general-use"),
     ("Human / Portrait (u2net_human_seg)", "u2net_human_seg"),
-    ("High Quality (birefnet, slower)", "birefnet-general"),
 ]
 
 
