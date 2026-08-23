@@ -7,15 +7,20 @@ can dial in exactly how much gets cut before saving.
 
 How it works
 ------------
-The AI model (rembg / U^2-Net) runs once per image and produces a
-continuous "confidence" alpha mask (0-255) of how likely each pixel is to
-be foreground. Moving the slider does NOT re-run the model - it just
-re-thresholds that cached mask, so the preview updates instantly:
+The AI model (rembg; pick from a few U^2-Net/IS-Net variants) runs once
+per image and produces a
+confidence mask, which is lightly smoothed and binarized into a cutout mask.
+That mask is converted to a signed distance field (how many pixels each
+point is from the cutout edge) and cached. Moving the slider does NOT
+re-run the model - it just grows or shrinks the cutout boundary by a number
+of pixels read off that cached field, so the preview updates instantly and
+the direction is guaranteed:
 
-    - Low strength  -> only very-confident background pixels are removed
-                       (safe, but some background may remain).
-    - High strength -> only very-confident foreground pixels are kept
-                       (aggressive, may eat into the subject's edges).
+    - Low strength  -> the kept area is grown outward, so more of the
+                       image survives (safer, may keep a thin edge of
+                       background).
+    - High strength -> the kept area is shrunk inward (aggressive, may
+                       eat into the subject's edges).
 
 Run:
     pip install -r requirements.txt
@@ -28,6 +33,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 try:
     from rembg import new_session
@@ -39,7 +45,25 @@ except ImportError:
 PREVIEW_MAX = 480       # max width/height of each preview panel, in pixels
 CHECKER_SIZE = 12       # checkerboard square size, in pixels (shows transparency)
 DEFAULT_STRENGTH = 50   # slider default, 0-100
-SOFT_BAND = 40          # width of the alpha feather band (0-255 scale), keeps edges smooth
+MASK_THRESHOLD = 127    # binarize the AI's (alpha-matted) output at this level
+MAX_RADIUS = 20         # max pixels the cutout boundary can grow/shrink by
+FEATHER = 3             # half-width, in pixels, of the smoothed edge transition
+
+# Model to use for the initial AI pass. Pick based on your subject matter:
+#   General (u2net)              - solid all-purpose default
+#   General v2 (isnet-general)   - newer, often sharper edges than u2net
+#   Human / Portrait             - tuned for people, best on portrait photos
+#
+# NOTE: rembg also ships an "isnet-anime" model, but it was tested here and
+# found to output near-zero confidence across the entire frame on real
+# anime/illustration art (not just at the edges - everywhere), making its
+# mask unusable. It's deliberately left out of this list until that's
+# understood; u2net performs well on illustrated/anime content in practice.
+MODELS = [
+    ("General (u2net)", "u2net"),
+    ("General v2 (isnet-general-use)", "isnet-general-use"),
+    ("Human / Portrait (u2net_human_seg)", "u2net_human_seg"),
+]
 
 
 def make_checkerboard(size, square=CHECKER_SIZE):
@@ -67,9 +91,10 @@ class BackgroundRemoverApp:
         root.geometry("1040x680")
         root.minsize(760, 520)
 
-        self.session = None
+        self.sessions = {}           # model_key -> rembg session (cached, lazy-created)
         self.original_image = None   # PIL RGBA, full resolution
-        self.raw_alpha = None        # numpy float32 array, full resolution, values 0-255
+        self.signed_dist = None      # numpy float32 array, full resolution, px to cutout edge
+                                      # (positive = inside the kept area, negative = outside)
         self._original_photo = None  # keep a reference so Tk doesn't garbage-collect it
         self._result_photo = None
         self.work_queue = queue.Queue()
@@ -85,6 +110,15 @@ class BackgroundRemoverApp:
         ttk.Button(toolbar, text="Open Image...", command=self.open_image).pack(side="left")
         self.save_btn = ttk.Button(toolbar, text="Save Result...", command=self.save_image, state="disabled")
         self.save_btn.pack(side="left", padx=(8, 0))
+
+        ttk.Label(toolbar, text="Model:").pack(side="left", padx=(16, 4))
+        self.model_var = tk.StringVar(value=MODELS[0][0])
+        model_combo = ttk.Combobox(
+            toolbar, textvariable=self.model_var, values=[label for label, _ in MODELS],
+            state="readonly", width=30,
+        )
+        model_combo.pack(side="left")
+        model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
 
         self.status_var = tk.StringVar(value="Open an image to begin.")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side="left", padx=16)
@@ -104,7 +138,7 @@ class BackgroundRemoverApp:
         self.result_canvas.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=4)
 
         self.original_canvas.bind("<Configure>", lambda e: self.original_image and self._render_original())
-        self.result_canvas.bind("<Configure>", lambda e: self.raw_alpha is not None and self._render_result())
+        self.result_canvas.bind("<Configure>", lambda e: self.signed_dist is not None and self._render_result())
 
         slider_frame = ttk.Frame(self.root, padding=8)
         slider_frame.pack(side="bottom", fill="x")
@@ -123,8 +157,8 @@ class BackgroundRemoverApp:
 
         ttk.Label(
             self.root,
-            text="Low = keep more of the image (safer, may leave background). "
-                 "High = cut more aggressively (may eat into the subject).",
+            text="Low = grow the cutout outward, keeping more of the image (safer, may keep a "
+                 "thin edge of background). High = shrink it inward (may eat into the subject).",
             foreground="#888",
         ).pack(side="bottom", pady=(0, 6))
 
@@ -143,12 +177,23 @@ class BackgroundRemoverApp:
             return
 
         self.original_image = img
-        self.raw_alpha = None
+        self.signed_dist = None
         self.save_btn.state(["disabled"])
         self.slider.state(["disabled"])
         self.result_canvas.delete("all")
         self._render_original()
         self._start_background_removal()
+
+    def _on_model_change(self, _event=None):
+        if self.original_image is not None:
+            self.signed_dist = None
+            self.save_btn.state(["disabled"])
+            self.slider.state(["disabled"])
+            self._start_background_removal()
+
+    def _model_key(self):
+        label = self.model_var.get()
+        return next((key for lbl, key in MODELS if lbl == label), MODELS[0][1])
 
     def _start_background_removal(self):
         if rembg_remove is None:
@@ -160,16 +205,39 @@ class BackgroundRemoverApp:
             self.status_var.set("rembg is not installed.")
             return
 
-        self.status_var.set("Removing background... (first run downloads the AI model, ~180 MB)")
-        threading.Thread(target=self._remove_background_worker, daemon=True).start()
+        model_key = self._model_key()
+        note = "" if model_key in self.sessions else " (first use of this model downloads it, ~40-180 MB)"
+        self.status_var.set(f"Removing background with '{model_key}'...{note}")
+        threading.Thread(target=self._remove_background_worker, args=(model_key,), daemon=True).start()
 
-    def _remove_background_worker(self):
+    def _remove_background_worker(self, model_key):
         try:
-            if self.session is None:
-                self.session = new_session("u2net")
-            result = rembg_remove(self.original_image, session=self.session)
-            alpha = np.array(result.split()[-1], dtype=np.float32)
-            self.work_queue.put(("done", alpha))
+            session = self.sessions.get(model_key)
+            if session is None:
+                session = new_session(model_key)
+                self.sessions[model_key] = session
+            # NOTE: alpha_matting is intentionally NOT used here. Its trimap
+            # step hard-erodes the model's initial mask (by
+            # alpha_matting_erode_size px) to decide what counts as "certain"
+            # foreground, and for thin/detailed subjects (anime line art,
+            # thin limbs, weapons) that erosion can wipe out most of the
+            # subject before matting even begins - it was observed to erase
+            # nearly an entire character down to a couple of small fragments.
+            result = rembg_remove(self.original_image, session=session)
+            raw_alpha = np.array(result.split()[-1], dtype=np.float32)
+
+            # Light smoothing to reduce speckle noise before binarizing,
+            # without eroding thin real detail the way matting's trimap did.
+            raw_alpha = gaussian_filter(raw_alpha, sigma=1.5)
+
+            # Binarize once, then precompute a signed distance field (pixels
+            # to the nearest edge, positive inside the kept area) so the
+            # slider can grow/shrink the cutout with just a compare per move.
+            mask = raw_alpha >= MASK_THRESHOLD
+            dist_in = distance_transform_edt(mask)
+            dist_out = distance_transform_edt(~mask)
+            signed_dist = (dist_in - dist_out).astype(np.float32)
+            self.work_queue.put(("done", signed_dist))
         except Exception as exc:
             self.work_queue.put(("error", str(exc)))
 
@@ -178,7 +246,7 @@ class BackgroundRemoverApp:
             while True:
                 kind, payload = self.work_queue.get_nowait()
                 if kind == "done":
-                    self.raw_alpha = payload
+                    self.signed_dist = payload
                     self.slider.state(["!disabled"])
                     self.save_btn.state(["!disabled"])
                     self.status_var.set("Done. Drag the slider to adjust removal strength.")
@@ -192,18 +260,25 @@ class BackgroundRemoverApp:
 
     def _on_slider_move(self, _value):
         self.strength_label.config(text=f"{self.strength_var.get()}%")
-        if self.raw_alpha is not None:
+        if self.signed_dist is not None:
             self._render_result()
 
     def _thresholded_alpha(self):
-        """Re-threshold the cached raw alpha mask using the current slider value."""
+        """Grow/shrink the cached cutout boundary using the current slider value.
+
+        strength=0   -> boundary pushed outward by MAX_RADIUS px (keep more)
+        strength=50  -> boundary unchanged (the AI's own cutout)
+        strength=100 -> boundary pulled inward by MAX_RADIUS px (cut more)
+
+        This reads directly off the precomputed signed distance field, so it
+        stays correct regardless of how noisy or oddly-scaled a given model's
+        raw confidence output is - the direction can't invert and the result
+        can't linger at a ghostly half-opacity the way raw-value thresholding
+        could.
+        """
         strength = self.strength_var.get()  # 0-100
-        threshold = strength / 100.0 * 255.0
-        low = threshold - SOFT_BAND / 2
-        high = threshold + SOFT_BAND / 2
-        if high <= low:
-            high = low + 1
-        alpha = (self.raw_alpha - low) / (high - low) * 255.0
+        offset = (50 - strength) / 50.0 * MAX_RADIUS
+        alpha = (self.signed_dist + offset) / FEATHER * 127.5 + 127.5
         return np.clip(alpha, 0, 255).astype(np.uint8)
 
     def _composited_result(self):
@@ -241,7 +316,7 @@ class BackgroundRemoverApp:
         canvas.create_image(cw // 2, ch // 2, image=self._result_photo, anchor="center")
 
     def save_image(self):
-        if self.raw_alpha is None:
+        if self.signed_dist is None:
             return
         path = filedialog.asksaveasfilename(
             title="Save result",
