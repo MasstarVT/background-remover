@@ -59,19 +59,28 @@ BRUSH_MAX = 150         # largest touch-up brush radius, in original-image pixel
 DEFAULT_BRUSH = 40
 
 # Model to use for the initial AI pass. Pick based on your subject matter:
-#   General (u2net)              - solid all-purpose default
-#   General v2 (isnet-general)   - newer, often sharper edges than u2net
+#   General (u2net)              - solid all-purpose default, fast (~1s), small (~180MB)
+#   General v2 (isnet-general)   - newer, often sharper edges than u2net, similar speed
 #   Human / Portrait             - tuned for people, best on portrait photos
+#   High Quality (birefnet)      - 2024 state-of-the-art model, noticeably sharper edges
+#                                   in testing; much slower (~5-10s/image on CPU) and a
+#                                   large one-time download (~970MB)
 #
 # NOTE: rembg also ships an "isnet-anime" model, but it was tested here and
 # found to output near-zero confidence across the entire frame on real
 # anime/illustration art (not just at the edges - everywhere), making its
 # mask unusable. It's deliberately left out of this list until that's
 # understood; u2net performs well on illustrated/anime content in practice.
+#
+# A "confident but wrong" mask (e.g. a background object visually merged into
+# the subject's silhouette, like a moon tucked right behind a character) is a
+# composition ambiguity no model here fully resolves - all four were tested
+# against exactly that case. That's what the touch-up brush is for.
 MODELS = [
     ("General (u2net)", "u2net"),
     ("General v2 (isnet-general-use)", "isnet-general-use"),
     ("Human / Portrait (u2net_human_seg)", "u2net_human_seg"),
+    ("High Quality (birefnet, slower)", "birefnet-general"),
 ]
 
 
@@ -250,7 +259,12 @@ class BackgroundRemoverApp:
             return
 
         model_key = self._model_key()
-        note = "" if model_key in self.sessions else " (first use of this model downloads it, ~40-180 MB)"
+        if model_key in self.sessions:
+            note = ""
+        elif model_key == "birefnet-general":
+            note = " (first use downloads ~970 MB, then this model itself takes ~5-10s/image)"
+        else:
+            note = " (first use of this model downloads it, ~40-180 MB)"
         self.status_var.set(f"Removing background with '{model_key}'...{note}")
         threading.Thread(target=self._remove_background_worker, args=(model_key,), daemon=True).start()
 

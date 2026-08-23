@@ -1,17 +1,45 @@
 # Background Remover
 
 A small cross-platform desktop app (Windows / Linux / macOS) that removes
-the background from a photo. It shows a side-by-side before/after preview
-and a **Removal Strength** slider you can drag to control exactly how much
-gets cut, before saving.
+the background from a photo. It shows a side-by-side before/after preview,
+a **Removal Strength** slider, a **Model** picker, and a manual **touch-up
+brush** for anything the AI gets wrong.
 
-- Low strength → keeps more of the image (safer, some background may remain).
-- High strength → cuts more aggressively (may eat into the subject's edges).
+## How it works
 
-The AI model ([rembg](https://github.com/danielgatis/rembg), a U²-Net based
-background remover) runs once per image. Moving the slider just
-re-thresholds the cached result, so the preview updates instantly with no
-lag.
+The AI model ([rembg](https://github.com/danielgatis/rembg)) runs once per
+image and produces a cutout mask, which is converted to a signed distance
+field (how many pixels each point is from the cutout edge) and cached.
+Moving the slider does NOT re-run the model - it just grows or shrinks the
+cutout boundary by pixels read off that cached field, so the preview
+updates instantly:
+
+- Low strength → the kept area is grown outward, so more of the image
+  survives (safer, may keep a thin edge of background).
+- High strength → the kept area is shrunk inward (aggressive, may eat into
+  the subject's edges).
+
+**Touch-up brush**: for anything the slider can't fix - a background blob
+the AI is genuinely confident is foreground (common when something bright
+sits right behind/against the subject) - pick **Keep** or **Remove** and
+paint directly over the preview. Painted areas override the slider with a
+soft edge, and **Save Result** bakes in both.
+
+**Model picker**: four models are available, trading speed for accuracy:
+
+| Model | Speed | Notes |
+|---|---|---|
+| General (u2net) | fast (~1s), ~180MB download | good all-purpose default |
+| General v2 (isnet-general-use) | fast | newer, often sharper edges than u2net |
+| Human / Portrait (u2net_human_seg) | fast | tuned for people |
+| High Quality (birefnet, slower) | slow (~5-10s/image on CPU), ~970MB download | 2024 state-of-the-art model, noticeably sharper edges in testing |
+
+None of these (including the AI-anime-specific `isnet-anime`, which was
+tested and dropped - it output near-zero confidence across the entire
+frame on real anime art) can resolve a genuine *composition* ambiguity,
+like a moon drawn directly behind a character so it reads as part of the
+same visual object. That's what the touch-up brush is for, not a model
+quality issue.
 
 ## Requirements
 
@@ -50,14 +78,19 @@ pip install -r requirements.txt
 python bg_remover_gui.py
 ```
 
-On first use, `rembg` downloads its AI model (~180 MB) to a local cache
+On first use of a given model, `rembg` downloads it to a local cache
 (`~/.u2net` on Linux/macOS, `%USERPROFILE%\.u2net` on Windows). This only
-happens once.
+happens once per model - see the size/speed table above before picking
+"High Quality" on a slow connection.
 
 ## Usage
 
 1. Click **Open Image...** and pick a photo.
-2. Wait a moment for the AI pass to finish (status bar shows progress).
-3. Drag the **Removal Strength** slider while watching the preview
-   (checkerboard = transparent) until only the subject remains.
-4. Click **Save Result...** to export as a PNG with transparency.
+2. Wait for the AI pass to finish (status bar shows progress). Try a
+   different **Model** if the default cutout isn't a good starting point.
+3. Drag **Removal Strength** while watching the preview (checkerboard =
+   transparent) to dial in the cutout boundary.
+4. For anything left over the slider can't fix (or anything it took away
+   that it shouldn't have), pick **Keep** or **Remove** under Touch-up
+   brush and paint directly on the preview.
+5. Click **Save Result...** to export as a PNG with transparency.
