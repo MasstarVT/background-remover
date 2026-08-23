@@ -22,10 +22,16 @@ the direction is guaranteed:
     - High strength -> the kept area is shrunk inward (aggressive, may
                        eat into the subject's edges).
 
+On top of that, a manual touch-up brush lets you paint directly over the
+preview to force an area to always be kept or always removed (e.g. a stray
+background blob the AI insists is foreground) - painted areas override the
+slider wherever you've painted, with a soft edge.
+
 Run:
     pip install -r requirements.txt
     python bg_remover_gui.py
 """
+import math
 import queue
 import threading
 import tkinter as tk
@@ -48,6 +54,9 @@ DEFAULT_STRENGTH = 50   # slider default, 0-100
 MASK_THRESHOLD = 127    # binarize the AI's (alpha-matted) output at this level
 MAX_RADIUS = 20         # max pixels the cutout boundary can grow/shrink by
 FEATHER = 3             # half-width, in pixels, of the smoothed edge transition
+BRUSH_MIN = 5           # smallest touch-up brush radius, in original-image pixels
+BRUSH_MAX = 150         # largest touch-up brush radius, in original-image pixels
+DEFAULT_BRUSH = 40
 
 # Model to use for the initial AI pass. Pick based on your subject matter:
 #   General (u2net)              - solid all-purpose default
@@ -95,8 +104,12 @@ class BackgroundRemoverApp:
         self.original_image = None   # PIL RGBA, full resolution
         self.signed_dist = None      # numpy float32 array, full resolution, px to cutout edge
                                       # (positive = inside the kept area, negative = outside)
+        self.override = None         # numpy float32 array, full resolution, manual touch-ups:
+                                      # +1 = always keep, -1 = always remove, 0 = no override
         self._original_photo = None  # keep a reference so Tk doesn't garbage-collect it
         self._result_photo = None
+        self._result_geom = None     # (offset_x, offset_y, scale) mapping result canvas -> image
+        self._last_paint_xy = None
         self.work_queue = queue.Queue()
 
         self._build_ui()
@@ -123,6 +136,29 @@ class BackgroundRemoverApp:
         self.status_var = tk.StringVar(value="Open an image to begin.")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side="left", padx=16)
 
+        touchup_bar = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        touchup_bar.pack(side="top", fill="x")
+
+        ttk.Label(touchup_bar, text="Touch-up brush:").pack(side="left")
+        self.brush_mode_var = tk.StringVar(value="off")
+        self.brush_radios = []
+        for value, text in (("off", "Off"), ("keep", "Keep"), ("remove", "Remove")):
+            rb = ttk.Radiobutton(touchup_bar, text=text, value=value, variable=self.brush_mode_var)
+            rb.pack(side="left", padx=(4, 0))
+            self.brush_radios.append(rb)
+
+        ttk.Label(touchup_bar, text="   Brush size:").pack(side="left")
+        self.brush_size_var = tk.IntVar(value=DEFAULT_BRUSH)
+        self.brush_scale = ttk.Scale(
+            touchup_bar, from_=BRUSH_MIN, to=BRUSH_MAX, orient="horizontal",
+            variable=self.brush_size_var, length=120,
+        )
+        self.brush_scale.pack(side="left", padx=(4, 0))
+
+        self.clear_touchup_btn = ttk.Button(touchup_bar, text="Clear Touch-ups", command=self.clear_touchups)
+        self.clear_touchup_btn.pack(side="left", padx=(12, 0))
+        self._set_brush_enabled(False)
+
         panels = ttk.Frame(self.root, padding=(8, 0))
         panels.pack(side="top", fill="both", expand=True)
         panels.columnconfigure(0, weight=1)
@@ -139,6 +175,9 @@ class BackgroundRemoverApp:
 
         self.original_canvas.bind("<Configure>", lambda e: self.original_image and self._render_original())
         self.result_canvas.bind("<Configure>", lambda e: self.signed_dist is not None and self._render_result())
+        self.result_canvas.bind("<ButtonPress-1>", self._on_paint_start)
+        self.result_canvas.bind("<B1-Motion>", self._on_paint_drag)
+        self.result_canvas.bind("<ButtonRelease-1>", self._on_paint_end)
 
         slider_frame = ttk.Frame(self.root, padding=8)
         slider_frame.pack(side="bottom", fill="x")
@@ -158,7 +197,8 @@ class BackgroundRemoverApp:
         ttk.Label(
             self.root,
             text="Low = grow the cutout outward, keeping more of the image (safer, may keep a "
-                 "thin edge of background). High = shrink it inward (may eat into the subject).",
+                 "thin edge of background). High = shrink it inward (may eat into the subject). "
+                 "Stray areas the slider can't fix? Pick Keep/Remove above and paint over them.",
             foreground="#888",
         ).pack(side="bottom", pady=(0, 6))
 
@@ -178,8 +218,10 @@ class BackgroundRemoverApp:
 
         self.original_image = img
         self.signed_dist = None
+        self.override = None
         self.save_btn.state(["disabled"])
         self.slider.state(["disabled"])
+        self._set_brush_enabled(False)
         self.result_canvas.delete("all")
         self._render_original()
         self._start_background_removal()
@@ -187,8 +229,10 @@ class BackgroundRemoverApp:
     def _on_model_change(self, _event=None):
         if self.original_image is not None:
             self.signed_dist = None
+            self.override = None
             self.save_btn.state(["disabled"])
             self.slider.state(["disabled"])
+            self._set_brush_enabled(False)
             self._start_background_removal()
 
     def _model_key(self):
@@ -247,9 +291,11 @@ class BackgroundRemoverApp:
                 kind, payload = self.work_queue.get_nowait()
                 if kind == "done":
                     self.signed_dist = payload
+                    self.override = np.zeros_like(payload)
                     self.slider.state(["!disabled"])
                     self.save_btn.state(["!disabled"])
-                    self.status_var.set("Done. Drag the slider to adjust removal strength.")
+                    self._set_brush_enabled(True)
+                    self.status_var.set("Done. Drag the slider, or paint touch-ups on the preview.")
                     self._render_result()
                 elif kind == "error":
                     self.status_var.set("Background removal failed.")
@@ -279,6 +325,16 @@ class BackgroundRemoverApp:
         strength = self.strength_var.get()  # 0-100
         offset = (50 - strength) / 50.0 * MAX_RADIUS
         alpha = (self.signed_dist + offset) / FEATHER * 127.5 + 127.5
+        alpha = np.clip(alpha, 0, 255)
+
+        if self.override is not None and np.any(self.override):
+            # Manual touch-ups win over the slider wherever painted, with a
+            # soft edge so the brushed area doesn't have a hard seam.
+            influence = np.clip(gaussian_filter(self.override, sigma=FEATHER), -1, 1)
+            forced = np.where(influence >= 0, 255.0, 0.0)
+            weight = np.abs(influence)
+            alpha = alpha * (1 - weight) + forced * weight
+
         return np.clip(alpha, 0, 255).astype(np.uint8)
 
     def _composited_result(self):
@@ -308,12 +364,89 @@ class BackgroundRemoverApp:
         max_dim = max(200, min(cw, ch, PREVIEW_MAX))
         w, h = result.size
         disp_w, disp_h = fit_size(w, h, max_dim)
+        scale = disp_w / w
+        offset_x = cw // 2 - disp_w // 2
+        offset_y = ch // 2 - disp_h // 2
+        self._result_geom = (offset_x, offset_y, scale)
         disp = result.resize((disp_w, disp_h), Image.LANCZOS)
         checker = make_checkerboard((disp_w, disp_h))
         composed = Image.alpha_composite(checker, disp)
         self._result_photo = ImageTk.PhotoImage(composed)
         canvas.delete("all")
         canvas.create_image(cw // 2, ch // 2, image=self._result_photo, anchor="center")
+
+    # -------------------------------------------------------- Touch-up brush --
+    def _set_brush_enabled(self, enabled):
+        state = ["!disabled"] if enabled else ["disabled"]
+        for rb in self.brush_radios:
+            rb.state(state)
+        self.brush_scale.state(state)
+        self.clear_touchup_btn.state(state)
+        if not enabled:
+            self.brush_mode_var.set("off")
+
+    def clear_touchups(self):
+        if self.override is not None:
+            self.override[:] = 0
+            self._render_result()
+
+    def _canvas_to_image_xy(self, event):
+        if self._result_geom is None or self.original_image is None:
+            return None
+        offset_x, offset_y, scale = self._result_geom
+        img_x = (event.x - offset_x) / scale
+        img_y = (event.y - offset_y) / scale
+        w, h = self.original_image.size
+        if 0 <= img_x < w and 0 <= img_y < h:
+            return img_x, img_y
+        return None
+
+    def _stamp_brush(self, cx, cy):
+        r = self.brush_size_var.get()
+        value = 1.0 if self.brush_mode_var.get() == "keep" else -1.0
+        h, w = self.override.shape
+        x0, x1 = max(0, int(cx - r)), min(w, int(cx + r) + 1)
+        y0, y1 = max(0, int(cy - r)), min(h, int(cy + r) + 1)
+        if x0 >= x1 or y0 >= y1:
+            return
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        circle = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+        self.override[y0:y1, x0:x1][circle] = value
+
+    def _stamp_line(self, p0, p1):
+        (x0, y0), (x1, y1) = p0, p1
+        dist = math.hypot(x1 - x0, y1 - y0)
+        step = max(1.0, self.brush_size_var.get() / 2.0)
+        steps = max(1, int(dist / step))
+        for i in range(steps + 1):
+            t = i / steps
+            self._stamp_brush(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+
+    def _on_paint_start(self, event):
+        if self.brush_mode_var.get() == "off" or self.override is None:
+            return
+        pt = self._canvas_to_image_xy(event)
+        if pt is None:
+            return
+        self._last_paint_xy = pt
+        self._stamp_brush(*pt)
+        self._render_result()
+
+    def _on_paint_drag(self, event):
+        if self.brush_mode_var.get() == "off" or self.override is None:
+            return
+        pt = self._canvas_to_image_xy(event)
+        if pt is None:
+            return
+        if self._last_paint_xy is not None:
+            self._stamp_line(self._last_paint_xy, pt)
+        else:
+            self._stamp_brush(*pt)
+        self._last_paint_xy = pt
+        self._render_result()
+
+    def _on_paint_end(self, _event):
+        self._last_paint_xy = None
 
     def save_image(self):
         if self.signed_dist is None:
