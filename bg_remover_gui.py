@@ -41,7 +41,7 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
-from scipy.ndimage import distance_transform_edt, gaussian_filter
+from scipy.ndimage import binary_fill_holes, distance_transform_edt, gaussian_filter, label
 
 try:
     from rembg import new_session
@@ -66,6 +66,15 @@ PREVIEW_MAX = 480       # max width/height of each preview panel, in pixels
 CHECKER_SIZE = 12       # checkerboard square size, in pixels (shows transparency)
 DEFAULT_STRENGTH = 50   # slider default, 0-100
 MASK_THRESHOLD = 127    # binarize the AI's (alpha-matted) output at this level
+HOLE_FILL_MAX = 2500    # px; enclosed background gaps inside the mask up to this
+                        # size are auto-filled (see _fill_small_holes) - a dark
+                        # fold in clothing or a wispy VFX strand can make the
+                        # model briefly lose confidence mid-subject, punching a
+                        # small hole through something that should stay solid.
+                        # True negative space (a gap between limbs, the open
+                        # loop of a curved object) is topologically connected
+                        # to the real exterior background, not enclosed, so
+                        # it's never touched by this.
 MAX_RADIUS = 40         # max pixels the cutout boundary can grow/shrink by
 FEATHER_MIN = 1         # smallest allowed edge-softness slider value, in pixels
 FEATHER_MAX = 15        # largest allowed edge-softness slider value, in pixels
@@ -138,6 +147,31 @@ def fit_size(w, h, max_dim):
     """Scale (w, h) down to fit within max_dim while keeping aspect ratio."""
     scale = min(max_dim / w, max_dim / h, 1.0)
     return max(1, int(w * scale)), max(1, int(h * scale))
+
+
+def _fill_small_holes(mask, max_size=HOLE_FILL_MAX):
+    """Fill small enclosed background gaps inside a binary foreground mask.
+
+    binary_fill_holes finds every background region NOT connected to the
+    mask's exterior - i.e. fully surrounded by foreground. Real negative
+    space (the gap between crossed arms, the open loop of a curved object)
+    always touches the true exterior background at some point and is never
+    "enclosed" in this sense, so it's naturally excluded here regardless of
+    size. What's left - small enclosed gaps - is reliably segmentation
+    noise (e.g. a dark fold in clothing, a wispy VFX strand) rather than
+    intentional detail, so only those below max_size get filled; anything
+    larger is left alone in case it turns out not to fit that pattern.
+    """
+    filled = binary_fill_holes(mask)
+    holes = filled & ~mask
+    if not holes.any():
+        return mask
+    hole_labels, n_holes = label(holes)
+    sizes = np.bincount(hole_labels.ravel())
+    small_ids = [i for i in range(1, n_holes + 1) if sizes[i] <= max_size]
+    if not small_ids:
+        return mask
+    return mask | np.isin(hole_labels, small_ids)
 
 
 def cover_resize(img, target_w, target_h):
@@ -635,6 +669,7 @@ class BackgroundRemoverApp:
             # to the nearest edge, positive inside the kept area) so the
             # slider can grow/shrink the cutout with just a compare per move.
             mask = raw_alpha >= MASK_THRESHOLD
+            mask = _fill_small_holes(mask)
             dist_in = distance_transform_edt(mask)
             dist_out = distance_transform_edt(~mask)
             signed_dist = (dist_in - dist_out).astype(np.float32)
