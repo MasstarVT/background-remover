@@ -25,21 +25,28 @@ sits right behind/against the subject) - pick **Keep** or **Remove** and
 paint directly over the preview. Painted areas override the slider with a
 soft edge, and **Save Result** bakes in both.
 
-**Model picker**: four models are available, trading speed for accuracy:
+**Model picker**: six models are available, trading speed for accuracy.
+Default is `birefnet-massive` - in testing against a real illustration
+where a background object (a moon) was drawn visually merged with the
+subject, it was the *only* one of six models that correctly separated
+them, at every strength setting.
 
 | Model | Speed | Notes |
 |---|---|---|
-| General (u2net) | fast (~1s), ~180MB download | good all-purpose default |
+| High Quality (birefnet-massive, slower) | slow (~5-10s/image on CPU), ~930MB download | **default** - best result in testing, see above |
+| High Quality (birefnet-general, slower) | slow, ~930MB download | very good edges; didn't separate the moon case above |
+| High Quality (bria-rmbg, slower) | slow, ~980MB download | well-regarded commercial-grade model; also didn't separate the moon case |
+| General (u2net) | fast (~1s), ~180MB download | good default when you don't need the slow models |
 | General v2 (isnet-general-use) | fast | newer, often sharper edges than u2net |
 | Human / Portrait (u2net_human_seg) | fast | tuned for people |
-| High Quality (birefnet, slower) | slow (~5-10s/image on CPU), ~970MB download | 2024 state-of-the-art model, noticeably sharper edges in testing |
 
-None of these (including the AI-anime-specific `isnet-anime`, which was
-tested and dropped - it output near-zero confidence across the entire
-frame on real anime art) can resolve a genuine *composition* ambiguity,
-like a moon drawn directly behind a character so it reads as part of the
-same visual object. That's what the touch-up brush is for, not a model
-quality issue.
+An AI-anime-specific model (`isnet-anime`) was also tested and dropped -
+it output near-zero confidence across the entire frame on real anime art.
+
+Even the best model here can't always resolve a genuine *composition*
+ambiguity - something visually merged with the subject reads as part of
+the same object to any generic segmentation model. That's what the
+touch-up brush is for.
 
 ## Requirements
 

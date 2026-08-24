@@ -58,13 +58,25 @@ BRUSH_MIN = 5           # smallest touch-up brush radius, in original-image pixe
 BRUSH_MAX = 150         # largest touch-up brush radius, in original-image pixels
 DEFAULT_BRUSH = 40
 
-# Model to use for the initial AI pass. Pick based on your subject matter:
-#   General (u2net)              - solid all-purpose default, fast (~1s), small (~180MB)
-#   General v2 (isnet-general)   - newer, often sharper edges than u2net, similar speed
+# Model to use for the initial AI pass. Pick based on your subject matter.
+# The three "High Quality" options are all large (~930-980MB one-time
+# download) and slow (~5-10s/image on CPU) - they trade speed for accuracy.
+#
+#   High Quality (birefnet-massive) - best result in testing: the ONLY model
+#                                   of six tried that correctly separated a
+#                                   background object (a moon) visually
+#                                   merged with the subject, at every
+#                                   strength setting. Try this first.
+#   High Quality (birefnet-general) - very good edges, but did not separate
+#                                   the moon case above; may still win on
+#                                   other images
+#   High Quality (bria-rmbg)     - well-regarded commercial-grade model;
+#                                   also did not separate the moon case
+#   General (u2net)              - fast (~1s), small (~180MB), solid default
+#                                   when you don't need the slow models
+#   General v2 (isnet-general)   - newer, often sharper edges than u2net,
+#                                   similar speed
 #   Human / Portrait             - tuned for people, best on portrait photos
-#   High Quality (birefnet)      - 2024 state-of-the-art model, noticeably sharper edges
-#                                   in testing; much slower (~5-10s/image on CPU) and a
-#                                   large one-time download (~970MB)
 #
 # NOTE: rembg also ships an "isnet-anime" model, but it was tested here and
 # found to output near-zero confidence across the entire frame on real
@@ -72,16 +84,19 @@ DEFAULT_BRUSH = 40
 # mask unusable. It's deliberately left out of this list until that's
 # understood; u2net performs well on illustrated/anime content in practice.
 #
-# A "confident but wrong" mask (e.g. a background object visually merged into
-# the subject's silhouette, like a moon tucked right behind a character) is a
-# composition ambiguity no model here fully resolves - all four were tested
-# against exactly that case. That's what the touch-up brush is for.
+# A "confident but wrong" mask (a background object visually merged into the
+# subject's silhouette) is a composition ambiguity most models can't resolve
+# on their own - birefnet-massive was the exception in testing, but for
+# anything it still gets wrong, that's what the touch-up brush is for.
 MODELS = [
-    ("High Quality (birefnet, slower)", "birefnet-general"),
+    ("High Quality (birefnet-massive, slower)", "birefnet-massive"),
+    ("High Quality (birefnet-general, slower)", "birefnet-general"),
+    ("High Quality (bria-rmbg, slower)", "bria-rmbg"),
     ("General (u2net)", "u2net"),
     ("General v2 (isnet-general-use)", "isnet-general-use"),
     ("Human / Portrait (u2net_human_seg)", "u2net_human_seg"),
 ]
+SLOW_MODELS = {"birefnet-massive", "birefnet-general", "bria-rmbg"}
 
 
 def make_checkerboard(size, square=CHECKER_SIZE):
@@ -261,8 +276,8 @@ class BackgroundRemoverApp:
         model_key = self._model_key()
         if model_key in self.sessions:
             note = ""
-        elif model_key == "birefnet-general":
-            note = " (first use downloads ~970 MB, then this model itself takes ~5-10s/image)"
+        elif model_key in SLOW_MODELS:
+            note = " (first use downloads ~930-980 MB, then this model itself takes ~5-10s/image)"
         else:
             note = " (first use of this model downloads it, ~40-180 MB)"
         self.status_var.set(f"Removing background with '{model_key}'...{note}")
