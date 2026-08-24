@@ -27,7 +27,19 @@ the cutout to how sharp or soft the original photo's focus is.
 the AI is genuinely confident is foreground (common when something bright
 sits right behind/against the subject) - pick **Keep** or **Remove** and
 paint directly over the preview. Painted areas override the slider with a
-soft edge, and **Save Result** bakes in both.
+soft edge, and **Save Result** bakes in both. A ring at the cursor shows
+the brush's actual size (it scales with zoom). Made a mistake? **Ctrl+Z**
+undoes the last stroke, **Ctrl+Y** (or Ctrl+Shift+Z) redoes it - or use the
+**Undo**/**Redo** buttons. **Clear Touch-ups** wipes everything painted so
+far (also undoable).
+
+**Zoom & pan** on the result preview: scroll the mouse wheel to zoom in/out
+around the cursor (so whatever you're pointing at stays put), up to 1600%,
+down to the point where the whole image fits the panel. Click **Fit** to
+snap back to that fitted view. To pan around while zoomed in, drag with the
+**middle mouse button** (works no matter what the brush is set to), or
+left-click-drag while the touch-up brush is **Off** (left-drag paints
+instead whenever a brush mode is active).
 
 **Model picker**: six models are available, trading speed for accuracy.
 Default is `birefnet-massive` - in testing against a real illustration
@@ -109,7 +121,8 @@ happening after you've already opened one.
    make that boundary crisper or blurrier.
 4. For anything left over the slider can't fix (or anything it took away
    that it shouldn't have), pick **Keep** or **Remove** under Touch-up
-   brush and paint directly on the preview.
+   brush and paint directly on the preview. Scroll to zoom in first for
+   precise work near edges; middle-drag to pan around while zoomed in.
 5. Click **Save Result...** to export as a PNG with transparency.
 
 Your last-used model and the folders you last opened/saved from are
