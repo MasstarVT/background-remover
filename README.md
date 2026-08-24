@@ -2,8 +2,8 @@
 
 A small cross-platform desktop app (Windows / Linux / macOS) that removes
 the background from a photo. It shows a side-by-side before/after preview,
-a **Removal Strength** slider, a **Model** picker, and a manual **touch-up
-brush** for anything the AI gets wrong.
+a **Removal Strength** slider, an **Edge Softness** slider, a **Model**
+picker, and a manual **touch-up brush** for anything the AI gets wrong.
 
 ## How it works
 
@@ -18,6 +18,10 @@ updates instantly:
   survives (safer, may keep a thin edge of background).
 - High strength → the kept area is shrunk inward (aggressive, may eat into
   the subject's edges).
+
+**Edge Softness** controls how gradual that boundary transition is, from a
+crisp 1px edge up to a soft 15px blend (default 3px) - useful for matching
+the cutout to how sharp or soft the original photo's focus is.
 
 **Touch-up brush**: for anything the slider can't fix - a background blob
 the AI is genuinely confident is foreground (common when something bright
@@ -90,14 +94,25 @@ On first use of a given model, `rembg` downloads it to a local cache
 happens once per model - see the size/speed table above before picking
 "High Quality" on a slow connection.
 
+The app starts warming up the selected model in the background as soon as
+the window opens (status bar shows "Warming up..." then "Ready."), so that
+load time is hidden behind the time you spend picking a file instead of
+happening after you've already opened one.
+
 ## Usage
 
 1. Click **Open Image...** and pick a photo.
 2. Wait for the AI pass to finish (status bar shows progress). Try a
    different **Model** if the default cutout isn't a good starting point.
 3. Drag **Removal Strength** while watching the preview (checkerboard =
-   transparent) to dial in the cutout boundary.
+   transparent) to dial in the cutout boundary. Use **Edge Softness** to
+   make that boundary crisper or blurrier.
 4. For anything left over the slider can't fix (or anything it took away
    that it shouldn't have), pick **Keep** or **Remove** under Touch-up
    brush and paint directly on the preview.
 5. Click **Save Result...** to export as a PNG with transparency.
+
+Your last-used model and the folders you last opened/saved from are
+remembered between runs, in a small config file at
+`~/.background_remover_config.json` (`%USERPROFILE%` on Windows). Delete
+it any time to reset to the defaults.

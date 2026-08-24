@@ -31,10 +31,12 @@ Run:
     pip install -r requirements.txt
     python bg_remover_gui.py
 """
+import json
 import math
 import queue
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
@@ -53,10 +55,14 @@ CHECKER_SIZE = 12       # checkerboard square size, in pixels (shows transparenc
 DEFAULT_STRENGTH = 50   # slider default, 0-100
 MASK_THRESHOLD = 127    # binarize the AI's (alpha-matted) output at this level
 MAX_RADIUS = 40         # max pixels the cutout boundary can grow/shrink by
-FEATHER = 3             # half-width, in pixels, of the smoothed edge transition
+FEATHER_MIN = 1         # smallest allowed edge-softness slider value, in pixels
+FEATHER_MAX = 15        # largest allowed edge-softness slider value, in pixels
+DEFAULT_FEATHER = 3     # default half-width, in pixels, of the smoothed edge transition
 BRUSH_MIN = 5           # smallest touch-up brush radius, in original-image pixels
 BRUSH_MAX = 150         # largest touch-up brush radius, in original-image pixels
 DEFAULT_BRUSH = 40
+
+CONFIG_PATH = Path.home() / ".background_remover_config.json"
 
 # Model to use for the initial AI pass. Pick based on your subject matter.
 # The three "High Quality" options are all large (~930-980MB one-time
@@ -117,6 +123,35 @@ def fit_size(w, h, max_dim):
     return max(1, int(w * scale)), max(1, int(h * scale))
 
 
+def load_config(path=CONFIG_PATH):
+    """Load saved preferences (last model, last folders) as a plain dict.
+
+    A missing file (first run) or a corrupt/unreadable one (hand-edited,
+    truncated by a crash, etc.) is not fatal - either way we just fall back
+    to an empty dict and the app uses its normal defaults.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_config(config, path=CONFIG_PATH):
+    """Best-effort save of preferences. Never raises - a read-only or
+    missing home directory shouldn't crash the app over a convenience
+    feature.
+    """
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+    except OSError:
+        pass
+
+
 class BackgroundRemoverApp:
     def __init__(self, root):
         self.root = root
@@ -124,7 +159,9 @@ class BackgroundRemoverApp:
         root.geometry("1040x680")
         root.minsize(760, 520)
 
+        self.config = load_config()  # persisted preferences: model, last open/save dirs
         self.sessions = {}           # model_key -> rembg session (cached, lazy-created)
+        self.sessions_lock = threading.Lock()  # guards session creation, see _get_or_create_session
         self.original_image = None   # PIL RGBA, full resolution
         self.signed_dist = None      # numpy float32 array, full resolution, px to cutout edge
                                       # (positive = inside the kept area, negative = outside)
@@ -138,6 +175,7 @@ class BackgroundRemoverApp:
 
         self._build_ui()
         self._poll_queue()
+        self._preload_default_model()
 
     # ---------------------------------------------------------------- UI --
     def _build_ui(self):
@@ -149,7 +187,7 @@ class BackgroundRemoverApp:
         self.save_btn.pack(side="left", padx=(8, 0))
 
         ttk.Label(toolbar, text="Model:").pack(side="left", padx=(16, 4))
-        self.model_var = tk.StringVar(value=MODELS[0][0])
+        self.model_var = tk.StringVar(value=self._model_label_for_key(self.config.get("model")))
         model_combo = ttk.Combobox(
             toolbar, textvariable=self.model_var, values=[label for label, _ in MODELS],
             state="readonly", width=30,
@@ -206,17 +244,35 @@ class BackgroundRemoverApp:
         slider_frame = ttk.Frame(self.root, padding=8)
         slider_frame.pack(side="bottom", fill="x")
 
-        ttk.Label(slider_frame, text="Removal Strength").pack(side="left")
+        strength_row = ttk.Frame(slider_frame)
+        strength_row.pack(side="top", fill="x")
+
+        ttk.Label(strength_row, text="Removal Strength").pack(side="left")
         self.strength_var = tk.IntVar(value=DEFAULT_STRENGTH)
-        self.strength_label = ttk.Label(slider_frame, text=f"{DEFAULT_STRENGTH}%", width=5)
+        self.strength_label = ttk.Label(strength_row, text=f"{DEFAULT_STRENGTH}%", width=5)
         self.strength_label.pack(side="right")
 
         self.slider = ttk.Scale(
-            slider_frame, from_=0, to=100, orient="horizontal",
+            strength_row, from_=0, to=100, orient="horizontal",
             variable=self.strength_var, command=self._on_slider_move,
         )
         self.slider.pack(side="left", fill="x", expand=True, padx=8)
         self.slider.state(["disabled"])
+
+        feather_row = ttk.Frame(slider_frame)
+        feather_row.pack(side="top", fill="x", pady=(6, 0))
+
+        ttk.Label(feather_row, text="Edge Softness").pack(side="left")
+        self.feather_var = tk.IntVar(value=DEFAULT_FEATHER)
+        self.feather_label = ttk.Label(feather_row, text=f"{DEFAULT_FEATHER}px", width=5)
+        self.feather_label.pack(side="right")
+
+        self.feather_slider = ttk.Scale(
+            feather_row, from_=FEATHER_MIN, to=FEATHER_MAX, orient="horizontal",
+            variable=self.feather_var, command=self._on_feather_move,
+        )
+        self.feather_slider.pack(side="left", fill="x", expand=True, padx=8)
+        self.feather_slider.state(["disabled"])
 
         ttk.Label(
             self.root,
@@ -231,6 +287,7 @@ class BackgroundRemoverApp:
         path = filedialog.askopenfilename(
             title="Choose an image",
             filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")],
+            initialdir=self.config.get("last_open_dir", ""),
         )
         if not path:
             return
@@ -240,28 +297,80 @@ class BackgroundRemoverApp:
             messagebox.showerror("Could not open image", str(exc))
             return
 
+        self.config["last_open_dir"] = str(Path(path).resolve().parent)
+        save_config(self.config)
+
         self.original_image = img
         self.signed_dist = None
         self.override = None
         self.save_btn.state(["disabled"])
         self.slider.state(["disabled"])
+        self.feather_slider.state(["disabled"])
         self._set_brush_enabled(False)
         self.result_canvas.delete("all")
         self._render_original()
         self._start_background_removal()
 
     def _on_model_change(self, _event=None):
+        self.config["model"] = self._model_key()
+        save_config(self.config)
         if self.original_image is not None:
             self.signed_dist = None
             self.override = None
             self.save_btn.state(["disabled"])
             self.slider.state(["disabled"])
+            self.feather_slider.state(["disabled"])
             self._set_brush_enabled(False)
             self._start_background_removal()
 
     def _model_key(self):
         label = self.model_var.get()
         return next((key for lbl, key in MODELS if lbl == label), MODELS[0][1])
+
+    def _model_label_for_key(self, model_key):
+        """Look up the combobox label for a saved model key, falling back to
+        the default model if the key is missing or no longer recognized
+        (e.g. an older config file, or MODELS changed between versions)."""
+        return next((label for label, key in MODELS if key == model_key), MODELS[0][0])
+
+    def _get_or_create_session(self, model_key):
+        """Return the cached rembg session for model_key, creating it if needed.
+
+        Both the startup preload and a user-triggered removal call this, and
+        it's guarded by a lock so they can't race to build two sessions for
+        the same (possibly large, slow-to-load) model at once: whichever
+        call arrives first does the loading while the other blocks, then
+        finds the session already cached and returns it immediately.
+        """
+        with self.sessions_lock:
+            session = self.sessions.get(model_key)
+            if session is None:
+                session = new_session(model_key)
+                self.sessions[model_key] = session
+            return session
+
+    def _preload_default_model(self):
+        """Kick off loading the last-used (or default) model as soon as the
+        window appears, in a background thread, so its load time - which can
+        be 15-30s for the large "High Quality" models - is hidden behind the
+        time the user spends picking a file instead of happening afterward,
+        when they're just staring at "Removing background...".
+        """
+        if new_session is None:
+            return
+        model_key = self._model_key()
+        self.status_var.set(f"Warming up '{model_key}'... this may take a while the first time.")
+        threading.Thread(target=self._preload_worker, args=(model_key,), daemon=True).start()
+
+    def _preload_worker(self, model_key):
+        try:
+            self._get_or_create_session(model_key)
+        except Exception:
+            # Not fatal here - any real problem (bad model key, no internet
+            # for the download, etc.) will surface with a proper error
+            # dialog when the user actually tries to remove a background.
+            pass
+        self.work_queue.put(("preload_done", model_key))
 
     def _start_background_removal(self):
         if rembg_remove is None:
@@ -285,10 +394,7 @@ class BackgroundRemoverApp:
 
     def _remove_background_worker(self, model_key):
         try:
-            session = self.sessions.get(model_key)
-            if session is None:
-                session = new_session(model_key)
-                self.sessions[model_key] = session
+            session = self._get_or_create_session(model_key)
             # NOTE: alpha_matting is intentionally NOT used here. Its trimap
             # step hard-erodes the model's initial mask (by
             # alpha_matting_erode_size px) to decide what counts as "certain"
@@ -322,6 +428,7 @@ class BackgroundRemoverApp:
                     self.signed_dist = payload
                     self.override = np.zeros_like(payload)
                     self.slider.state(["!disabled"])
+                    self.feather_slider.state(["!disabled"])
                     self.save_btn.state(["!disabled"])
                     self._set_brush_enabled(True)
                     self.status_var.set("Done. Drag the slider, or paint touch-ups on the preview.")
@@ -329,12 +436,25 @@ class BackgroundRemoverApp:
                 elif kind == "error":
                     self.status_var.set("Background removal failed.")
                     messagebox.showerror("Background removal failed", payload)
+                elif kind == "preload_done":
+                    # Only touch the status bar if nothing else has already
+                    # taken it over (the user opened an image while the
+                    # preload was still running, a removal is in progress
+                    # or done, etc.) - the preload message is only relevant
+                    # while it's still the most recent thing that happened.
+                    if self.status_var.get().startswith("Warming up"):
+                        self.status_var.set("Ready.")
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
 
     def _on_slider_move(self, _value):
         self.strength_label.config(text=f"{self.strength_var.get()}%")
+        if self.signed_dist is not None:
+            self._render_result()
+
+    def _on_feather_move(self, _value):
+        self.feather_label.config(text=f"{self.feather_var.get()}px")
         if self.signed_dist is not None:
             self._render_result()
 
@@ -352,14 +472,15 @@ class BackgroundRemoverApp:
         could.
         """
         strength = self.strength_var.get()  # 0-100
+        feather = self.feather_var.get()    # edge-softness slider, in pixels
         offset = (50 - strength) / 50.0 * MAX_RADIUS
-        alpha = (self.signed_dist + offset) / FEATHER * 127.5 + 127.5
+        alpha = (self.signed_dist + offset) / feather * 127.5 + 127.5
         alpha = np.clip(alpha, 0, 255)
 
         if self.override is not None and np.any(self.override):
             # Manual touch-ups win over the slider wherever painted, with a
             # soft edge so the brushed area doesn't have a hard seam.
-            influence = np.clip(gaussian_filter(self.override, sigma=FEATHER), -1, 1)
+            influence = np.clip(gaussian_filter(self.override, sigma=feather), -1, 1)
             forced = np.where(influence >= 0, 255.0, 0.0)
             weight = np.abs(influence)
             alpha = alpha * (1 - weight) + forced * weight
@@ -484,6 +605,7 @@ class BackgroundRemoverApp:
             title="Save result",
             defaultextension=".png",
             filetypes=[("PNG image", "*.png")],
+            initialdir=self.config.get("last_save_dir", ""),
         )
         if not path:
             return
@@ -491,6 +613,8 @@ class BackgroundRemoverApp:
         try:
             result.save(path)
             self.status_var.set(f"Saved to {path}")
+            self.config["last_save_dir"] = str(Path(path).resolve().parent)
+            save_config(self.config)
         except Exception as exc:
             messagebox.showerror("Could not save image", str(exc))
 
