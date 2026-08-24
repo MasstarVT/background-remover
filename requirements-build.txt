@@ -1,0 +1,4 @@
+# Extra dependency needed only to package the app into a standalone
+# executable (see app.spec / README's "Building a standalone executable").
+# Not needed to just run from source - that's requirements.txt.
+pyinstaller>=6.0.0

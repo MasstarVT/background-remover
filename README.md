@@ -85,6 +85,41 @@ ambiguity - something visually merged with the subject reads as part of
 the same object to any generic segmentation model. That's what the
 touch-up brush is for.
 
+## Download a pre-built executable
+
+Don't want to install Python? Grab a standalone build for Windows or Linux
+from the [Releases page](https://github.com/MasstarVT/background-remover/releases)
+(built automatically by [GitHub Actions](.github/workflows/build.yml) from a
+version tag) - or from that workflow's
+[Actions run artifacts](https://github.com/MasstarVT/background-remover/actions/workflows/build.yml)
+for the latest unreleased build. Unzip/untar it anywhere and run
+`BackgroundRemover.exe` (Windows) or `./BackgroundRemover` (Linux) - it's a
+folder, not a single file, so keep the whole folder together.
+
+**First launch still needs internet.** The app doesn't bundle the AI model -
+`rembg` downloads it the first time it's used and caches it locally (see
+"On first use of a given model" below). The default model is ~930MB, so the
+very first run will pause on "Removing background..." while that downloads;
+every run after that is offline and instant to start.
+
+### Building it yourself
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-build.txt
+pyinstaller app.spec
+```
+
+The build lands in `dist/BackgroundRemover/` - run the executable inside
+that folder. `app.spec` is set up to pull in onnxruntime/numpy/scipy's and
+tkinterdnd2's non-obvious runtime pieces (PyInstaller's static import
+analysis misses some of these on its own); it works as-is on both Windows
+and Linux. It's a folder build rather than `--onefile` on purpose - a
+onefile build has to unpack this app's fairly large dependencies (onnxruntime,
+scipy) to a fresh temp directory on every single launch, which was tested
+here and made every startup noticeably slower than just running the exe
+directly out of a folder.
+
 ## Requirements
 
 - Python 3.9+
