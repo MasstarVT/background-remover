@@ -3,3 +3,8 @@ onnxruntime>=1.16.0
 Pillow>=10.0.0
 numpy>=1.24.0
 scipy>=1.11.0
+# Optional: enables dragging an image file onto the window to load it. The
+# app works fully without it - "Open Image..." still works either way -
+# this just unlocks the drag-and-drop shortcut. Best-effort/degrades
+# gracefully if not installed (see bg_remover_gui.py's import guard).
+tkinterdnd2>=0.4.2

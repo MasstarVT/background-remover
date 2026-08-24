@@ -3,7 +3,10 @@
 A small cross-platform desktop app (Windows / Linux / macOS) that removes
 the background from a photo. It shows a side-by-side before/after preview,
 a **Removal Strength** slider, an **Edge Softness** slider, a **Model**
-picker, and a manual **touch-up brush** for anything the AI gets wrong.
+picker, and a manual **touch-up brush** for anything the AI gets wrong. You
+can drag and drop an image onto the window to load it, replace the
+transparent background with a solid color or another image at save time,
+and export the cutout mask on its own.
 
 ## How it works
 
@@ -40,6 +43,24 @@ snap back to that fitted view. To pan around while zoomed in, drag with the
 **middle mouse button** (works no matter what the brush is set to), or
 left-click-drag while the touch-up brush is **Off** (left-drag paints
 instead whenever a brush mode is active).
+
+**Background replacement**: by default **Save Result...** exports a
+transparent PNG, same as before. Use the **Background** dropdown next to it
+to instead flatten the cutout onto a **Solid Color** (opens a color picker)
+or another **Image** (opens a file picker) before saving - **Choose...**
+re-opens that picker if you want to change the color/image without
+switching the dropdown away and back. A background image is scaled up just
+enough to cover the subject's full frame and then center-cropped to match
+its exact dimensions (like CSS `background-size: cover`) rather than being
+letterboxed or stretched. Once a background is flattened in, the alpha
+channel is no longer meaningful, so the save dialog also offers **JPEG** as
+an option alongside PNG (PNG stays the default, and is the only option for
+"Transparent").
+
+**Export Mask...** saves just the current cutout mask - after the slider
+and any touch-ups, same as what Save Result uses - as a standalone
+grayscale PNG (0 = fully removed, 255 = fully kept), for anyone who wants
+to bring the mask into another editing tool.
 
 **Model picker**: six models are available, trading speed for accuracy.
 Default is `birefnet-massive` - in testing against a real illustration
@@ -81,6 +102,12 @@ touch-up brush is for.
   sudo pacman -S tk
   ```
 
+- `tkinterdnd2` (in requirements.txt) is optional - it enables dragging an
+  image file onto the window to load it. If it's missing or fails to
+  install, the app still runs fine; you just lose the drag-and-drop
+  shortcut and use **Open Image...** instead (a note is printed to the
+  console, nothing pops up).
+
 ## Setup
 
 ```bash
@@ -113,7 +140,8 @@ happening after you've already opened one.
 
 ## Usage
 
-1. Click **Open Image...** and pick a photo.
+1. Click **Open Image...** and pick a photo, or drag an image file onto
+   the window.
 2. Wait for the AI pass to finish (status bar shows progress). Try a
    different **Model** if the default cutout isn't a good starting point.
 3. Drag **Removal Strength** while watching the preview (checkerboard =
@@ -123,7 +151,12 @@ happening after you've already opened one.
    that it shouldn't have), pick **Keep** or **Remove** under Touch-up
    brush and paint directly on the preview. Scroll to zoom in first for
    precise work near edges; middle-drag to pan around while zoomed in.
-5. Click **Save Result...** to export as a PNG with transparency.
+5. Leave **Background** set to **Transparent** to export a PNG with
+   transparency (the default), or switch it to **Solid Color** / **Image**
+   to flatten the cutout onto something else first. Click **Save
+   Result...** to export.
+6. Click **Export Mask...** any time after the AI pass finishes to save
+   just the cutout mask on its own, separate from the color image.
 
 Your last-used model and the folders you last opened/saved from are
 remembered between runs, in a small config file at

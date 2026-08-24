@@ -37,7 +37,7 @@ import queue
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
@@ -49,6 +49,18 @@ try:
 except ImportError:
     rembg_remove = None
     new_session = None
+
+try:
+    # Optional: enables dragging an image file onto the window as an
+    # alternative to "Open Image...". Vanilla Tkinter has no built-in
+    # cross-platform drag-and-drop, and tkinterdnd2 is the standard
+    # well-maintained wrapper for it (Windows/Linux/macOS). The app must
+    # fully work without it - see _enable_drag_drop, which just skips
+    # registration (with a console note) when this import fails.
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
 
 PREVIEW_MAX = 480       # max width/height of each preview panel, in pixels
 CHECKER_SIZE = 12       # checkerboard square size, in pixels (shows transparency)
@@ -107,6 +119,8 @@ MODELS = [
 ]
 SLOW_MODELS = {"birefnet-massive", "birefnet-general", "bria-rmbg"}
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}  # what Open Image / drag-drop accept
+
 
 def make_checkerboard(size, square=CHECKER_SIZE):
     """Return an RGBA checkerboard image used to visualize transparent areas."""
@@ -124,6 +138,52 @@ def fit_size(w, h, max_dim):
     """Scale (w, h) down to fit within max_dim while keeping aspect ratio."""
     scale = min(max_dim / w, max_dim / h, 1.0)
     return max(1, int(w * scale)), max(1, int(h * scale))
+
+
+def cover_resize(img, target_w, target_h):
+    """Scale `img` up/down just enough to cover a target_w x target_h frame
+    (i.e. CSS `background-size: cover`), then center-crop the excess.
+
+    Chosen over "fit" (which would letterbox - leaving gaps the subject
+    wouldn't cover) or "stretch" (which distorts the background's aspect
+    ratio) because it always fills the whole frame behind the subject with
+    no visible gaps, at the cost of cropping some of the background image's
+    edges when its aspect ratio doesn't match the subject's.
+    """
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h))
+
+
+def composite_background(subject, mode, color=None, bg_image=None):
+    """Flatten `subject` (an RGBA PIL Image) onto a background per `mode`.
+
+    mode="transparent" -> subject is returned unchanged (still RGBA).
+    mode="color"        -> flattened onto a solid `color` (r, g, b) tuple.
+    mode="image"        -> flattened onto `bg_image` (a PIL Image),
+                            cover-resized (see cover_resize) to exactly the
+                            subject's dimensions first.
+
+    Returns a new PIL Image: RGBA for "transparent", RGB otherwise - once
+    everything behind the subject is an opaque chosen background, an alpha
+    channel is no longer meaningful (or wanted - it lets the output save as
+    JPEG too).
+    """
+    if mode == "transparent":
+        return subject
+    w, h = subject.size
+    if mode == "color":
+        bg = Image.new("RGB", (w, h), tuple(int(round(c)) for c in color))
+    elif mode == "image":
+        bg = cover_resize(bg_image.convert("RGB"), w, h)
+    else:
+        raise ValueError(f"unknown background mode: {mode!r}")
+    flat = Image.alpha_composite(bg.convert("RGBA"), subject)
+    return flat.convert("RGB")
 
 
 def load_config(path=CONFIG_PATH):
@@ -198,9 +258,15 @@ class BackgroundRemoverApp:
         self.undo_stack = []            # list of (y0, y1, x0, x1, prior_region_array)
         self.redo_stack = []
 
+        # --- Save-time background replacement -----------------------------
+        self.bg_color = None       # (r, g, b) chosen via colorchooser, or None if never picked
+        self.bg_image_path = None  # path to a chosen background image, or None if never picked
+        self._prev_bg_mode = "Transparent"  # to revert to if a color/image pick is canceled
+
         self._build_ui()
         self._poll_queue()
         self._preload_default_model()
+        self._enable_drag_drop()
 
     # ---------------------------------------------------------------- UI --
     def _build_ui(self):
@@ -210,6 +276,24 @@ class BackgroundRemoverApp:
         ttk.Button(toolbar, text="Open Image...", command=self.open_image).pack(side="left")
         self.save_btn = ttk.Button(toolbar, text="Save Result...", command=self.save_image, state="disabled")
         self.save_btn.pack(side="left", padx=(8, 0))
+        self.export_mask_btn = ttk.Button(
+            toolbar, text="Export Mask...", command=self.export_mask, state="disabled",
+        )
+        self.export_mask_btn.pack(side="left", padx=(4, 0))
+
+        ttk.Label(toolbar, text="Background:").pack(side="left", padx=(12, 4))
+        self.bg_mode_var = tk.StringVar(value="Transparent")
+        self.bg_mode_combo = ttk.Combobox(
+            toolbar, textvariable=self.bg_mode_var,
+            values=["Transparent", "Solid Color", "Image"],
+            state="readonly", width=11,
+        )
+        self.bg_mode_combo.pack(side="left")
+        self.bg_mode_combo.bind("<<ComboboxSelected>>", self._on_bg_mode_change)
+        self.bg_choose_btn = ttk.Button(
+            toolbar, text="Choose...", command=self._choose_background, state="disabled", width=9,
+        )
+        self.bg_choose_btn.pack(side="left", padx=(4, 0))
 
         ttk.Label(toolbar, text="Model:").pack(side="left", padx=(16, 4))
         self.model_var = tk.StringVar(value=self._model_label_for_key(self.config.get("model")))
@@ -363,6 +447,16 @@ class BackgroundRemoverApp:
         )
         if not path:
             return
+        self._load_image_path(path)
+
+    def _load_image_path(self, path):
+        """Load and start processing the image at `path`.
+
+        This is the shared landing point for both the "Open Image..." file
+        dialog and a drag-and-drop file (see _on_drop) - both just need to
+        get from "here's a path" to "it's loaded and the AI pass has
+        started" the same way.
+        """
         try:
             img = Image.open(path).convert("RGBA")
         except Exception as exc:
@@ -376,6 +470,7 @@ class BackgroundRemoverApp:
         self.signed_dist = None
         self.override = None
         self.save_btn.state(["disabled"])
+        self.export_mask_btn.state(["disabled"])
         self.slider.state(["disabled"])
         self.feather_slider.state(["disabled"])
         self._set_brush_enabled(False)
@@ -389,6 +484,50 @@ class BackgroundRemoverApp:
         self._render_original()
         self._start_background_removal()
 
+    def _enable_drag_drop(self):
+        """Register the window as a drop target for image files, if
+        tkinterdnd2 is installed. Best-effort: this app fully works with
+        just "Open Image..." if the optional package isn't available, so a
+        missing import degrades to a console note rather than a dialog
+        (dropping a file onto an unregistered window is silently a no-op
+        anyway, so there's nothing to explain to the user in the moment).
+        """
+        if DND_FILES is None:
+            print(
+                "Note: tkinterdnd2 is not installed, so drag-and-drop image "
+                "loading is disabled (pip install tkinterdnd2 to enable it). "
+                "Use 'Open Image...' instead."
+            )
+            return
+        # Registered on the top-level window plus both preview canvases -
+        # tkinterdnd2 drop targets don't bubble from child to parent, and
+        # the canvases are the largest, most obvious drop targets in the UI.
+        for widget in (self.root, self.original_canvas, self.result_canvas):
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+
+    def _on_drop(self, event):
+        """Handle a file (or files) dropped onto the window. Tk's drop data
+        is a single string in Tcl-list form - braces around any path that
+        contains spaces - so it's parsed with tk.splitlist rather than a
+        naive str.split.
+        """
+        try:
+            paths = self.root.tk.splitlist(event.data)
+        except Exception:
+            paths = [event.data]
+        for p in paths:
+            if Path(p).suffix.lower() in IMAGE_EXTS:
+                # Multiple files dropped at once: take the first valid image
+                # and ignore the rest, rather than asking the user to
+                # disambiguate for what's meant as a quick shortcut.
+                self._load_image_path(p)
+                return
+        messagebox.showerror(
+            "Could not open image",
+            "No supported image file (PNG/JPG/BMP/WEBP) was found in what was dropped.",
+        )
+
     def _on_model_change(self, _event=None):
         self.config["model"] = self._model_key()
         save_config(self.config)
@@ -396,6 +535,7 @@ class BackgroundRemoverApp:
             self.signed_dist = None
             self.override = None
             self.save_btn.state(["disabled"])
+            self.export_mask_btn.state(["disabled"])
             self.slider.state(["disabled"])
             self.feather_slider.state(["disabled"])
             self._set_brush_enabled(False)
@@ -512,6 +652,7 @@ class BackgroundRemoverApp:
                     self.slider.state(["!disabled"])
                     self.feather_slider.state(["!disabled"])
                     self.save_btn.state(["!disabled"])
+                    self.export_mask_btn.state(["!disabled"])
                     self._set_brush_enabled(True)
                     self.status_var.set("Done. Drag the slider, or paint touch-ups on the preview.")
                     self._render_result()
@@ -1001,19 +1142,97 @@ class BackgroundRemoverApp:
         self.undo_btn.state(["!disabled"] if self.undo_stack else ["disabled"])
         self.redo_btn.state(["!disabled"] if self.redo_stack else ["disabled"])
 
+    # ------------------------------------------------- Background (save) --
+    def _on_bg_mode_change(self, _event=None):
+        mode = self.bg_mode_var.get()
+        # Picking "Solid Color" / "Image" immediately prompts for the color
+        # or file, rather than leaving a chosen-but-unconfigured mode
+        # sitting in the dropdown - if the user cancels that prompt, the
+        # selection reverts to whatever it was before, rather than landing
+        # on a mode with nothing behind it yet.
+        ok = True
+        if mode == "Solid Color":
+            ok = self._pick_bg_color()
+        elif mode == "Image":
+            ok = self._pick_bg_image()
+        if not ok:
+            self.bg_mode_var.set(self._prev_bg_mode)
+        else:
+            self._prev_bg_mode = mode
+        self.bg_choose_btn.state(["!disabled"] if self.bg_mode_var.get() != "Transparent" else ["disabled"])
+
+    def _choose_background(self):
+        """"Choose..." button: re-open the color/image picker for whichever
+        background mode is currently selected, so the user can change it
+        without having to flip the dropdown away and back."""
+        mode = self.bg_mode_var.get()
+        if mode == "Solid Color":
+            self._pick_bg_color()
+        elif mode == "Image":
+            self._pick_bg_image()
+
+    def _pick_bg_color(self):
+        initial = self.bg_color or (255, 255, 255)
+        rgb, _hex = colorchooser.askcolor(color=initial, title="Choose background color")
+        if rgb is None:
+            return False
+        self.bg_color = tuple(int(round(c)) for c in rgb)
+        return True
+
+    def _pick_bg_image(self):
+        path = filedialog.askopenfilename(
+            title="Choose a background image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")],
+            initialdir=self.config.get("last_open_dir", ""),
+        )
+        if not path:
+            return False
+        try:
+            Image.open(path).convert("RGB")  # validate it's actually openable before committing
+        except Exception as exc:
+            messagebox.showerror("Could not open image", str(exc))
+            return False
+        self.bg_image_path = path
+        return True
+
     def save_image(self):
         if self.signed_dist is None:
             return
+        mode_label = self.bg_mode_var.get()
+        mode = {"Transparent": "transparent", "Solid Color": "color", "Image": "image"}[mode_label]
+        if mode == "color" and self.bg_color is None:
+            self.bg_color = (255, 255, 255)
+        if mode == "image" and not self.bg_image_path:
+            messagebox.showerror("No background image chosen", "Pick a background image first (Choose...).")
+            return
+
+        # A flattened (non-transparent) result has no meaningful alpha
+        # channel, so JPEG becomes a sensible option alongside PNG - offered
+        # only in that case, since "Transparent" must stay PNG (JPEG has no
+        # alpha channel at all).
+        if mode == "transparent":
+            filetypes = [("PNG image", "*.png")]
+        else:
+            filetypes = [("PNG image", "*.png"), ("JPEG image", "*.jpg *.jpeg")]
         path = filedialog.asksaveasfilename(
             title="Save result",
             defaultextension=".png",
-            filetypes=[("PNG image", "*.png")],
+            filetypes=filetypes,
             initialdir=self.config.get("last_save_dir", ""),
         )
         if not path:
             return
-        result = self._composited_result()
+
+        subject = self._composited_result()
         try:
+            if mode == "color":
+                result = composite_background(subject, "color", color=self.bg_color)
+            elif mode == "image":
+                result = composite_background(subject, "image", bg_image=Image.open(self.bg_image_path))
+            else:
+                result = subject
+            if Path(path).suffix.lower() in (".jpg", ".jpeg") and result.mode != "RGB":
+                result = result.convert("RGB")
             result.save(path)
             self.status_var.set(f"Saved to {path}")
             self.config["last_save_dir"] = str(Path(path).resolve().parent)
@@ -1021,9 +1240,37 @@ class BackgroundRemoverApp:
         except Exception as exc:
             messagebox.showerror("Could not save image", str(exc))
 
+    def export_mask(self):
+        """Export just the current alpha mask (post slider + touch-ups) as
+        a standalone grayscale image - 0 = fully removed, 255 = fully kept -
+        for people who want to bring the cutout into another editing tool.
+        """
+        if self.signed_dist is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export mask",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png")],
+            initialdir=self.config.get("last_save_dir", ""),
+        )
+        if not path:
+            return
+        mask = Image.fromarray(self._thresholded_alpha(), mode="L")
+        try:
+            mask.save(path)
+            self.status_var.set(f"Mask saved to {path}")
+            self.config["last_save_dir"] = str(Path(path).resolve().parent)
+            save_config(self.config)
+        except Exception as exc:
+            messagebox.showerror("Could not save mask", str(exc))
+
 
 def main():
-    root = tk.Tk()
+    # TkinterDnD.Tk() is a drop-in subclass of tk.Tk() that also loads the
+    # TkDnD extension drag-and-drop needs - only usable when tkinterdnd2 is
+    # installed (see _enable_drag_drop, which is what actually registers
+    # the drop targets and no-ops if this fell back to plain tk.Tk()).
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     try:
         style = ttk.Style()
         if "clam" in style.theme_names():
